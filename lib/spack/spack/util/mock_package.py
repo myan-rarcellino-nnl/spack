@@ -7,6 +7,7 @@ import collections
 
 import spack.provider_index
 import spack.util.naming
+import spack.util.spack_yaml as syaml
 from spack.dependency import Dependency
 from spack.spec import Spec
 from spack.version import Version
@@ -68,10 +69,26 @@ class MockPackageBase(object):
 
         return visited
 
-    def content_hash(self):
-        # Unlike real packages, MockPackage doesn't have a corresponding
-        # package.py file; in that sense, the content_hash is always the same.
-        return self.__class__.__name__
+    def artifact_hashes(self):
+        """Mock up the dictionary returned by PackageBase.artifact_hashes()"""
+        return syaml.syaml_dict(
+            [
+                ("package_hash", self.__class__.__name__),
+                (
+                    "sources",
+                    syaml.syaml_dict(
+                        [
+                            ("type", "artifact"),
+                            (
+                                "sha256",
+                                "98ea6e4f216f2fb4b69fff9b3a44842c38686ca685f3f55dc48c5d3fb1107be4",
+                            ),
+                        ]
+                    ),
+                ),
+                ("patches", ["612f1fa5282cf336e3c251d40d7d937f502ecb29c4e479ea4c334716150ab27b"]),
+            ]
+        )
 
 
 class MockPackageMultiRepo(object):

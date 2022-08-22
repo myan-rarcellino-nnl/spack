@@ -1212,6 +1212,12 @@ class Spec(object):
         for h in ht.hashes:
             setattr(self, h.attr, None)
 
+        # dictionary of source artifact hashes, set at concretization time
+        self._package_hash = None
+
+        # dictionary of source artifact hashes, set at concretization time
+        self._artifact_hashes = None
+
         # Python __hash__ is handled separately from the cached spec hashes
         self._dunder_hash = None
 
@@ -1782,15 +1788,11 @@ class Spec(object):
         Arguments:
             hash (spack.hash_types.SpecHashDescriptor): type of hash to generate.
         """
-        # TODO: currently we strip build dependencies by default.  Rethink
-        # this when we move to using package hashing on all specs.
-        if hash.override is not None:
-            return hash.override(self)
         node_dict = self.to_node_dict(hash=hash)
         json_text = sjson.dump(node_dict)
         return spack.util.hash.b32_hash(json_text)
 
-    def _cached_hash(self, hash, length=None, force=False):
+    def _cached_hash(self, hash, length=None):
         """Helper function for storing a cached hash on the spec.
 
         This will run spec_hash() with the deptype and package_hash
@@ -1800,7 +1802,6 @@ class Spec(object):
         Arguments:
             hash (spack.hash_types.SpecHashDescriptor): type of hash to generate.
             length (int): length of hash prefix to return (default is full hash string)
-            force (bool): cache the hash even if spec is not concrete (default False)
         """
         if not hash.attr:
             return self.spec_hash(hash)[:length]
@@ -1810,7 +1811,7 @@ class Spec(object):
             return hash_string[:length]
         else:
             hash_string = self.spec_hash(hash)
-            if force or self.concrete:
+            if self.concrete:
                 setattr(self, hash.attr, hash_string)
 
             return hash_string[:length]
@@ -1921,7 +1922,10 @@ class Spec(object):
         if self.namespace:
             d["namespace"] = self.namespace
 
-        params = syaml.syaml_dict(sorted(v.yaml_entry() for _, v in self.variants.items()))
+        # Get all variants *except* for patches.  Patches are included in "artifacts" below.
+        params = syaml.syaml_dict(
+            sorted(v.yaml_entry() for _, v in self.variants.items() if v.name != "patches")
+        )
 
         params.update(sorted(self.compiler_flags.items()))
         if params:
@@ -1939,25 +1943,17 @@ class Spec(object):
         if not self._concrete:
             d["concrete"] = False
 
-        if "patches" in self.variants:
-            variant = self.variants["patches"]
-            if hasattr(variant, "_patches_in_order_of_appearance"):
-                d["patches"] = variant._patches_in_order_of_appearance
+        # We use the attribute here instead of `self.package_hash()` because this should
+        # *always* be assigned at concretization time. We don't want to try to compute a
+        # package hash for concrete spec where a) the package might not exist, or b) the
+        # `dag_hash` didn't include the package hash when the spec was concretized.
+        if self._concrete and hash.package_hash:
+            if self._package_hash:
+                d["package_hash"] = self._package_hash
 
-        if self._concrete and hash.package_hash and self._package_hash:
-            # We use the attribute here instead of `self.package_hash()` because this
-            # should *always* be assignhed at concretization time. We don't want to try
-            # to compute a package hash for concrete spec where a) the package might not
-            # exist, or b) the `dag_hash` didn't include the package hash when the spec
-            # was concretized.
-            package_hash = self._package_hash
-
-            # Full hashes are in bytes
-            if not isinstance(package_hash, six.text_type) and isinstance(
-                package_hash, six.binary_type
-            ):
-                package_hash = package_hash.decode("utf-8")
-            d["package_hash"] = package_hash
+            if self._artifact_hashes:
+                for key, value in self._artifact_hashes.items():
+                    d[key] = value
 
         # Note: Relies on sorting dict by keys later in algorithm.
         deps = self._dependencies_dict(deptype=hash.deptype)
@@ -2130,8 +2126,17 @@ class Spec(object):
             # Old format
             name = next(iter(node))
             node = node[name]
+
         for h in ht.hashes:
             setattr(spec, h.attr, node.get(h.name, None))
+
+        # old and new-style package hash
+        if "package_hash" in node:
+            spec._package_hash = node["package_hash"]
+
+        # all source artifact hashes
+        if "sources" in node:
+            spec._artifact_hashes = syaml.syaml_dict([("sources", node["sources"])])
 
         spec.name = name
         spec.namespace = node.get("namespace", None)
@@ -2976,12 +2981,16 @@ class Spec(object):
             # We only assign package hash to not-yet-concrete specs, for which we know
             # we can compute the hash.
             if not spec.concrete:
-                # we need force=True here because package hash assignment has to happen
-                # before we mark concrete, so that we know what was *already* concrete.
-                spec._cached_hash(ht.package_hash, force=True)
+                # package hash assignment has to happen before we mark concrete, so that
+                # we know what was *already* concrete.
+                # can't use self.package here b/c not concrete yet
+                pkg_cls = spack.repo.path.get_pkg_class(spec.name)
+                pkg = pkg_cls(spec)
 
-                # keep this check here to ensure package hash is saved
-                assert getattr(spec, ht.package_hash.attr)
+                # TODO: make artifact hashes a static method
+                artifact_hashes = pkg.artifact_hashes()
+                spec._package_hash = artifact_hashes.pop("package_hash")
+                spec._artifact_hashes = artifact_hashes
 
         # Mark everything in the spec as concrete
         self._mark_concrete()
@@ -3839,6 +3848,8 @@ class Spec(object):
             self._normal = other._normal
             for h in ht.hashes:
                 setattr(self, h.attr, getattr(other, h.attr, None))
+            self._package_hash = getattr(other, "_package_hash", None)
+            self._artifact_hashes = getattr(other, "_artifact_hashes", None)
         else:
             self._dunder_hash = None
             # Note, we could use other._normal if we are copying all deps, but
@@ -3846,6 +3857,8 @@ class Spec(object):
             self._normal = False
             for h in ht.hashes:
                 setattr(self, h.attr, None)
+            self._package_hash = None
+            self._artifact_hashes = None
 
         return changed
 
@@ -4780,6 +4793,8 @@ class Spec(object):
             if h.attr not in ignore:
                 if hasattr(self, h.attr):
                     setattr(self, h.attr, None)
+        self._package_hash = None
+        self._artifact_hashes = None
         self._dunder_hash = None
 
     def __hash__(self):
